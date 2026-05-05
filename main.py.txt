@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""
+Winner Product Radar - Ultimate AliExpress/Alibaba Product Research Tool
+======================================================================
+
+A production-ready Apify Actor that discovers winning products using the
+Trust Algorithm. Filters by verification, ratings, orders, and quality signals.
+
+Author: Winner Product Radar
+Version: 1.0.0
+Apify Store: https://apify.com/winner-product-radar
+"""
+
+import asyncio
+import csv
+import json
+import math
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+from pathlib import Path
+
+# Apify SDK imports
+try:
+    from apify_client import ApifyClient
+    from apify_client.clients import ActorCallClient
+    APIFY_AVAILABLE = True
+except ImportError:
+    APIFY_AVAILABLE = False
+    print("WARNING: apify-client not installed. Run: pip install apify-client", file=sys.stderr)
+
+
+# ==============================================================================
+# TRUST ALGORITHM - Core Scoring Logic
+# ==============================================================================
+
+TRUST_WEIGHTS = {
+    "rating": 0.25,          # Product rating contributes 25%
+    "orders": 0.30,          # Order volume contributes 30%
+    "store_years": 0.15,    # Store seniority contributes 15%
+    "verification": 0.20,     # Verification badges contribute 20%
+    "quality_keywords": 0.10  # Quality signals contribute 10%
+}
+
+QUALITY_KEYWORDS = [
+    "original", "authentic", "genuine", "certified",
+    "iso", "ce", "rohs", "fcc", "ul certified",
+    "patent", "trademark", "premium", "top quality"
+]
+
+VERIFIED_PATTERNS = [
+    r"\bverified\b", r"\bverified supplier\b", r"\btrade assurance\b"
+]
+
+GOLD_SUPPLIER_PATTERNS = [
+    r"\bgold supplier\b", r"\bgold supplier\b", r"\b\d+\s*yrs?\b"
+]
+
+
+@dataclass
+class Product:
+    """Represents a scraped product with all available data."""
+    name: str = ""
+    url: str = ""
+    price: str = ""
+    original_price: str = ""
+    discount: str = ""
+    min_order: str = ""
+    rating: float = 0.0
+    rating_count: int = 0
+    orders: int = 0
+    store_name: str = ""
+    store_url: str = ""
+    store_years: int = 0
+    is_verified: bool = False
+    is_gold_supplier: bool = False
+    location: str = ""
+    shipping: str = ""
+    raw_data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ScoredProduct:
+    """A product with calculated trust score and filter status."""
+    product: Product
+    trust_score: float = 0.0
+    is_winner: bool = False
+    filter_reason: str = ""
+    matched_signals: List[str] = field(default_factory=list)
+
+
+class TrustAlgorithm:
+    """
+    The Trust Algorithm - scores products 0-100 based on multiple signals.
+    
+    Signals:
+    - Rating Score: Normalized rating (0-5) to (0-100)
+    - Order Score: Logarithmic normalization of order count
+    - Store Seniority: Years in business with diminishing returns
+    - Verification: Binary score for verified/gold supplier status
+    - Quality Keywords: Bonus for authentic/certified products
+    """
+    
+    def __init__(
+        self,
+        min_rating: float = 4.5,
+        min_orders: int = 100,
+        min_store_years: int = 1,
+        only_verified: bool = True,
+        only_gold: bool = True,
+        check_quality: bool = False,
+        trust_threshold: int = 70
+    ):
+        self.min_rating = min_rating
+        self.min_orders = min_orders
+        self.min_store_years = min_store_years
+        self.only_verified = only_verified
+        self.only_gold = only_gold
+        self.check_quality = check_quality
+        self.trust_threshold = trust_threshold
+    
+    def calculate_rating_score(self, rating: float) -> float:
+        """Convert 0-5 rating to 0-100 score."""
+        if rating <= 0:
+            return 0.0
+        return min(100, (rating / 5.0) * 100)
+    
+    def calculate_order_score(self, orders: int) -> float:
+        """
+        Logarithmic scoring for orders - rewards volume but with diminishing returns.
+        0 orders = 0, 100 orders ≈ 50, 1000 orders ≈ 75, 10000+ orders = 100
+        """
+        if orders <= 0:
+            return 0.0
+        if orders >= 10000:
+            return 100.0
+        return (math.log(orders + 1) / math.log(10001)) * 100
+    
+    def calculate_store_years_score(self, years: int) -> float:
+        """
+        Score based on store seniority.
+        0 yrs = 0, 1 yr = 30, 3 yrs = 60, 5 yrs = 80, 10+ yrs = 100
+        """
+        if years <= 0:
+            return 0.0
+        if years >= 10:
+            return 100.0
+        return min(100, (years / (years + 2)) * 120)
+    
+    def calculate_verification_score(self, product: Product) -> float:
+        """Binary + bonus for verification status."""
+        score = 0.0
+        if product.is_verified:
+            score += 50
+        if product.is_gold_supplier:
+            score += 30
+        if product.store_years >= 3:
+            score += 20
+        return min(100, score)
+    
+    def calculate_quality_score(self, product: Product) -> float:
+        """Check for quality signals in name."""
+        if not self.check_quality:
+            return 50  # Neutral if not checking
+        
+        text = (product.name + " " + product.store_name).lower()
+        matches = sum(1 for kw in QUALITY_KEYWORDS if kw.lower() in text)
+        
+        if matches == 0:
+            return 20
+        if matches == 1:
+            return 60
+        if matches == 2:
+            return 80
+        return 100
+    
+    def calculate_trust_score(self, product: Product) -> tuple[float, List[str]]:
+        """
+        Calculate overall trust score (0-100) for a product.
+        Returns (score, list_of_matched_signals)
+        """
+        signals = []
+        
+        rating_score = self.calculate_rating_score(product.rating)
+        if product.rating >= self.min_rating:
+            signals.append(f"Rating {product.rating} >= {self.min_rating}")
+        
+        order_score = self.calculate_order_score(product.orders)
+        if product.orders >= self.min_orders:
+            signals.append(f"Orders {product.orders} >= {self.min_orders}")
+        
+        years_score = self.calculate_store_years_score(product.store_years)
+        if product.store_years >= self.min_store_years:
+            signals.append(f"Store {product.store_years} yrs >= {self.min_store_years}")
+        
+        verify_score = self.calculate_verification_score(product)
+        if product.is_verified:
+            signals.append("Verified Supplier")
+        if product.is_gold_supplier:
+            signals.append("Gold Supplier")
+        
+        quality_score = self.calculate_quality_score(product)
+        
+        trust_score = (
+            rating_score * TRUST_WEIGHTS["rating"] +
+            order_score * TRUST_WEIGHTS["orders"] +
+            years_score * TRUST_WEIGHTS["store_years"] +
+            verify_score * TRUST_WEIGHTS["verification"] +
+            quality_score * TRUST_WEIGHTS["quality_keywords"]
+        )
+        
+        return round(trust_score, 1), signals
+    
+    def should_include(self, scored: ScoredProduct) -> tuple[bool, str]:
+        """Determine if product should be included based on filters."""
+        p = scored.product
+        
+        if self.only_verified and not p.is_verified:
+            return False, "Not a Verified Supplier"
+        
+        if self.only_gold and not p.is_gold_supplier:
+            return False, "Not a Gold Supplier"
+        
+        if p.rating < self.min_rating:
+            return False, f"Rating {p.rating} < {self.min_rating}"
+        
+        if p.orders < self.min_orders:
+            return False, f"Orders {p.orders} < {self.min_orders}"
+        
+        if p.store_years < self.min_store_years:
+            return False, f"Store {p.store_years} yrs < {self.min_store_years}"
+        
+        if scored.trust_score < self.trust_threshold:
+            return False, f"Trust Score {scored.trust_score} < {self.trust_threshold}"
+        
+        return True, "PASSED_ALL_FILTERS"
+
+
+# ==============================================================================
+# DATA PARSING
+# ==============================================================================
+
+def parse_orders(orders_text: str) -> int:
+    """Parse order count from various formats like '1.2k', '500+', etc."""
+    if not orders_text:
+        return 0
+    
+    text = orders_text.strip().lower().replace(",", "")
+    multipliers = {"k": 1000, "w": 10000, "m": 1000000}
+    
+    for suffix, mult in multipliers.items():
+        if suffix in text:
+            try:
+                num = float(text.replace(suffix, "").replace("+", ""))
+                return int(num * mult)
+            except ValueError:
+                pass
+    
+    match = re.search(r"[\d,]+", text)
+    if match:
+        try:
+            return int(match.group().replace(",", ""))
+        except ValueError:
+            pass
+    
+    return 0
+
+
+def parse_rating(rating_text: Any) -> float:
+    """Parse rating from string or number."""
+    if isinstance(rating_text, (int, float)):
+        return float(rating_text)
+    if not rating_text:
+        return 0.0
+    try:
+        return float(str(rating_text).strip())
+    except ValueError:
+        return 0.0
+
+
+def parse_store_years(text: str) -> int:
+    """Extract years from store info text."""
+    if not text:
+        return 0
+    match = re.search(r"(\d+)\s*(?:yrs?|years?)", text.lower())
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def parse_price(price_text: Any) -> str:
+    """Normalize price formatting."""
+    if isinstance(price_text, (int, float)):
+        return f"${price_text:.2f}"
+    if not price_text:
+        return "N/A"
+    price_text = str(price_text).strip()
+    if not price_text.startswith("$"):
+        price_text = f"${price_text}"
+    return price_text
+
+
+def is_verified_supplier(text: str) -> bool:
+    """Check if text indicates verified supplier."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(re.search(p, text_lower) for p in VERIFIED_PATTERNS)
+
+
+def is_gold_supplier(text: str) -> bool:
+    """Check if text indicates gold supplier."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    if "gold supplier" in text_lower:
+        return True
+    match = re.search(r"(\d+)\s*(?:yrs?|years?)", text_lower)
+    if match and int(match.group(1)) >= 3:
+        return True
+    return False
+
+
+def extract_product_from_item(item: Dict[str, Any]) -> Optional[Product]:
+    """Parse an Apify scraped item into a Product object."""
+    try:
+        name = item.get("title", "") or item.get("productTitle", "") or ""
+        if not name:
+            return None
+        
+        product = Product(
+            name=name,
+            url=item.get("productUrl", "") or item.get("url", "") or "",
+            price=parse_price(item.get("price", "")),
+            original_price=parse_price(item.get("originalPrice", "")),
+            discount=item.get("discount", ""),
+            min_order=item.get("moq", "") or item.get("minOrder", ""),
+            rating=parse_rating(item.get("reviewScore", "")),
+            rating_count=int(item.get("reviewCount", 0) or 0),
+            orders=parse_orders(item.get("orders", "")),
+            store_name=item.get("companyName", "") or item.get("storeName", ""),
+            store_url=item.get("storeUrl", "") or "",
+            store_years=parse_store_years(item.get("goldSupplierYears", "")),
+            is_verified=is_verified_supplier(str(item)),
+            is_gold_supplier=is_gold_supplier(str(item.get("companyName", ""))),
+            location=item.get("countryCode", "") or item.get("location", ""),
+            shipping=item.get("deliveryEstimate", "") or "",
+            raw_data=item
+        )
+        
+        return product
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# APIFY SCRAPER
+# ==============================================================================
+
+ACTOR_ID = "VtMFsKvKKwfL2TjZQ"  # AliExpress product scraper actor
+
+
+class ApifyScraper:
+    """Handles Apify actor calls and data fetching."""
+    
+    def __init__(self, token: str):
+        if not APIFY_AVAILABLE:
+            raise RuntimeError("apify-client required. Install: pip install apify-client")
+        self.client = ApifyClient(token)
+    
+    async def search_products(
+        self,
+        search_term: str,
+        max_products: int = 50,
+        only_verified: bool = True,
+        only_gold: bool = True
+    ) -> List[Product]:
+        """Search for products using Apify actor."""
+        
+        search_query = search_term
+        if only_verified and only_gold:
+            search_query = f"{search_term} verified gold supplier"
+        elif only_verified:
+            search_query = f"{search_term} verified"
+        elif only_gold:
+            search_query = f"{search_term} gold supplier"
+        
+        try:
+            run_input = {
+                "searchQuery": search_query,
+                "maxProductsPerQuery": max_products,
+                "maxPages": 3,
+                "proxyConfig": {"useApifyProxy": True}
+            }
+            
+            print(f"  Searching: '{search_query}' (max {max_products})", flush=True)
+            
+            actor_call = self.client.actor(ACTOR_ID).call(
+                run_input=run_input,
+                timeout_secs=120
+            )
+            
+            if actor_call.get("status") != "SUCCEEDED":
+                print(f"  Warning: Actor call failed: {actor_call.get('errorMessage', 'Unknown error')}", flush=True)
+                return []
+            
+            dataset_id = actor_call.get("defaultDatasetId")
+            if not dataset_id:
+                return []
+            
+            items = list(self.client.dataset(dataset_id).iterate_items())
+            print(f"  Retrieved {len(items)} raw items", flush=True)
+            
+            products = []
+            for item in items:
+                product = extract_product_from_item(item)
+                if product:
+                    products.append(product)
+            
+            return products
+            
+        except Exception as e:
+            print(f"  Error searching '{search_term}': {e}", flush=True)
+            return []
+
+
+# ==============================================================================
+# MAIN PROCESSOR
+# ==============================================================================
+
+class WinnerProductRadar:
+    """Main processor for the Winner Product Radar."""
+    
+    def __init__(self, token: str):
+        self.scraper = ApifyScraper(token)
+    
+    async def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Main execution method."""
+        start_time = datetime.now()
+        
+        search_terms = self._parse_search_terms(input_data.get("searchTerms", ""))
+        max_products = int(input_data.get("maxProductsPerTerm", 50))
+        
+        trust_config = {
+            "only_verified": input_data.get("onlyVerified", True),
+            "only_gold": input_data.get("onlyGoldSuppliers", True),
+            "min_rating": float(input_data.get("minRating", 4.5)),
+            "min_orders": int(input_data.get("minOrders", 100)),
+            "min_store_years": int(input_data.get("minStoreYears", 1)),
+            "check_quality": input_data.get("checkQualityKeywords", False),
+            "trust_threshold": int(input_data.get("trustScoreThreshold", 70))
+        }
+        
+        trust_algo = TrustAlgorithm(**trust_config)
+        
+        print("\n" + "=" * 70, flush=True)
+        print("WINNER PRODUCT RADAR - Trust Algorithm Engine", flush=True)
+        print("=" * 70, flush=True)
+        print(f"Search Terms: {len(search_terms)}", flush=True)
+        print(f"Max Products/Term: {max_products}", flush=True)
+        print(f"Filters: Verified={trust_config['only_verified']}, Gold={trust_config['only_gold']}", flush=True)
+        print(f"Min: Rating={trust_config['min_rating']}, Orders={trust_config['min_orders']}, Years={trust_config['min_store_years']}", flush=True)
+        print(f"Trust Threshold: {trust_config['trust_threshold']}", flush=True)
+        print("=" * 70 + "\n", flush=True)
+        
+        all_scored = []
+        total_scraped = 0
+        
+        for term in search_terms:
+            print(f"\n[TERM] '{term}'", flush=True)
+            print("-" * 50, flush=True)
+            
+            products = await self.scraper.search_products(
+                term, max_products,
+                trust_config["only_verified"],
+                trust_config["only_gold"]
+            )
+            
+            total_scraped += len(products)
+            
+            for product in products:
+                trust_score, signals = trust_algo.calculate_trust_score(product)
+                scored = ScoredProduct(
+                    product=product,
+                    trust_score=trust_score,
+                    matched_signals=signals
+                )
+                
+                should_include, reason = trust_algo.should_include(scored)
+                scored.is_winner = should_include
+                scored.filter_reason = reason
+                
+                all_scored.append(scored)
+                
+                if should_include:
+                    print(f"  ✓ WINNER: {product.name[:50]}... (Score: {trust_score})", flush=True)
+            
+            await asyncio.sleep(1)
+        
+        winners = [s for s in all_scored if s.is_winner]
+        winners.sort(key=lambda x: x.trust_score, reverse=True)
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        summary = {
+            "search_terms_count": len(search_terms),
+            "total_products_scraped": total_scraped,
+            "total_winners": len(winners),
+            "pass_rate": round(len(winners) / total_scraped * 100, 1) if total_scraped > 0 else 0,
+            "trust_threshold": trust_config["trust_threshold"],
+            "duration_seconds": round(duration, 1),
+            "filters_applied": trust_config
+        }
+        
+        return {
+            "winners": winners,
+            "summary": summary,
+            "generated_at": datetime.now().isoformat()
+        }
+    
+    def _parse_search_terms(self, terms_input: str) -> List[str]:
+        """Parse search terms from various input formats."""
+        if not terms_input:
+            return []
+        
+        terms = re.split(r"[,\n]+", terms_input)
+        terms = [t.strip() for t in terms if t.strip()]
+        
+        seen = set()
+        unique_terms = []
+        for t in terms:
+            t_lower = t.lower()
+            if t_lower not in seen:
+                seen.add(t_lower)
+                unique_terms.append(t)
+        
+        return unique_terms
+
+
+# ==============================================================================
+# REPORT GENERATORS
+# ==============================================================================
+
+def generate_json_report(results: Dict[str, Any]) -> str:
+    """Generate JSON output report."""
+    output = {
+        "generated_at": results["generated_at"],
+        "summary": results["summary"],
+        "winners": []
+    }
+    
+    for scored in results["winners"]:
+        p = scored.product
+        output["winners"].append({
+            "name": p.name,
+            "price": p.price,
+            "rating": p.rating,
+            "orders": p.orders,
+            "store_name": p.store_name,
+            "store_years": p.store_years,
+            "trust_score": scored.trust_score,
+            "is_verified": p.is_verified,
+            "is_gold_supplier": p.is_gold_supplier,
+            "url": p.url,
+            "matched_signals": scored.matched_signals
+        })
+    
+    return json.dumps(output, indent=2, ensure_ascii=False)
+
+
+def generate_csv_report(results: Dict[str, Any]) -> str:
+    """Generate CSV output report."""
+    output_lines = []
+    output_lines.append(
+        "Rank,Product Name,Price,Rating,Orders,Store Name,Store Years,"
+        "Verified,Gold Supplier,Trust Score,URL"
+    )
+    
+    for rank, scored in enumerate(results["winners"], 1):
+        p = scored.product
+        output_lines.append(
+            f'{rank},"{p.name}",{p.price},{p.rating},{p.orders},'
+            f'"{p.store_name}",{p.store_years},'
+            f'{p.is_verified},{p.is_gold_supplier},{scored.trust_score},'
+            f'"{p.url}"'
+        )
+    
+    return "\n".join(output_lines)
+
+
+def generate_markdown_report(results: Dict[str, Any]) -> str:
+    """Generate Markdown output report."""
+    lines = []
+    
+    lines.append("# 🏆 Winner Product Radar Report")
+    lines.append("")
+    
+    s = results["summary"]
+    lines.append("## 📊 Summary")
+    lines.append("")
+    lines.append(f"| Metric | Value |")
+    lines.append(f"|---------|-------|")
+    lines.append(f"| Search Terms | {s['search_terms_count']} |")
+    lines.append(f"| Products Scraped | {s['total_products_scraped']} |")
+    lines.append(f"| **Winners Found** | **{s['total_winners']}** |")
+    lines.append(f"| Pass Rate | {s['pass_rate']}% |")
+    lines.append(f"| Trust Threshold | {s['trust_threshold']} |")
+    lines.append(f"| Duration | {s['duration_seconds']}s |")
+    lines.append("")
+    
+    lines.append("## 🏅 Top Winners (Sorted by Trust Score)")
+    lines.append("")
+    lines.append("| # | Product | Price | Rating | Orders | Store | Years | Score |")
+    lines.append("|---|---------|-------|--------|--------|-------|-------|-------|")
+    
+    for rank, scored in enumerate(results["winners"][:20], 1):
+        p = scored.product
+        name = p.name[:40] + "..." if len(p.name) > 40 else p.name
+        store = p.store_name[:15] + "..." if len(p.store_name) > 15 else p.store_name
+        
+        lines.append(
+            f"| {rank} | {name} | {p.price} | {p.rating} | {p.orders:,} | "
+            f"{store} | {p.store_years} | **{scored.trust_score}** |"
+        )
+    
+    lines.append("")
+    lines.append("## 🔍 Winner Details")
+    lines.append("")
+    
+    for rank, scored in enumerate(results["winners"], 1):
+        p = scored.product
+        lines.append(f"### {rank}. {p.name}")
+        lines.append("")
+        lines.append(f"- **Price:** {p.price}")
+        lines.append(f"- **Rating:** {p.rating}/5.0 ({p.rating_count:,} reviews)")
+        lines.append(f"- **Orders:** {p.orders:,}")
+        lines.append(f"- **Store:** {p.store_name} ({p.store_years} years)")
+        lines.append(f"- **Verified:** {'✓ Yes' if p.is_verified else '✗ No'}")
+        lines.append(f"- **Gold Supplier:** {'✓ Yes' if p.is_gold_supplier else '✗ No'}")
+        lines.append(f"- **🏆 Trust Score:** {scored.trust_score}/100")
+        lines.append(f"- **Signals:** {', '.join(scored.matched_signals) if scored.matched_signals else 'None'}")
+        lines.append(f"- **URL:** [{p.url}]({p.url})")
+        lines.append("")
+    
+    lines.append("---")
+    lines.append(f"*Generated: {results['generated_at']}*")
+    
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# APIFY ACTOR ENTRY POINT
+# ==============================================================================
+
+async def main(input_data: Dict[str, Any]) -> None:
+    """Main entry point for the Apify Actor."""
+    print("Winner Product Radar v1.0.0 - Starting...", flush=True)
+    print("=" * 60, flush=True)
+    
+    token = input_data.get("token") or __import__("os").environ.get("APIFY_API_TOKEN")
+    if not token:
+        raise ValueError("APIFY_API_TOKEN environment variable not set")
+    
+    radar = WinnerProductRadar(token)
+    results = await radar.run(input_data)
+    
+    output_format = input_data.get("outputFormat", "both")
+    
+    output_dir = Path("/tmp/winner-radar-output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if output_format in ("json", "both"):
+        json_path = output_dir / f"winners_{timestamp}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(generate_json_report(results))
+        print(f"\n✓ JSON Report saved: {json_path}", flush=True)
+    
+    if output_format in ("csv", "both"):
+        csv_path = output_dir / f"winners_{timestamp}.csv"
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write(generate_csv_report(results))
+        print(f"✓ CSV Report saved: {csv_path}", flush=True)
+    
+    if output_format in ("markdown", "both"):
+        md_path = output_dir / f"winners_{timestamp}.md"
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(generate_markdown_report(results))
+        print(f"✓ Markdown Report saved: {md_path}", flush=True)
+    
+    print("\n" + "=" * 60, flush=True)
+    print("FINAL RESULTS", flush=True)
+    print("=" * 60, flush=True)
+    print(json.dumps({
+        "summary": results["summary"],
+        "top_5_winners": [
+            {
+                "name": s.product.name[:50],
+                "price": s.product.price,
+                "trust_score": s.trust_score
+            }
+            for s in results["winners"][:5]
+        ]
+    }, indent=2), flush=True)
+    
+    print(f"\n✓ Winner Product Radar complete! Found {results['summary']['total_winners']} winners.", flush=True)
+
+
+# ==============================================================================
+# STANDALONE CLI MODE (for local testing)
+# ==============================================================================
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        try:
+            input_data = json.loads(sys.argv[1])
+        except json.JSONDecodeError:
+            print("Error: Invalid JSON input", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("\n" + "=" * 60, flush=True)
+        print("WINNER PRODUCT RADAR - LOCAL TEST MODE", flush=True)
+        print("=" * 60, flush=True)
+        
+        input_data = {
+            "searchTerms": "316L stainless steel jewelry,PVD gold plated bracelet,wholesale fashion jewelry",
+            "maxProductsPerTerm": 30,
+            "onlyVerified": True,
+            "onlyGoldSuppliers": True,
+            "minRating": 4.5,
+            "minOrders": 50,
+            "minStoreYears": 1,
+            "checkQualityKeywords": True,
+            "trustScoreThreshold": 65,
+            "outputFormat": "both"
+        }
+        
+        print(f"\nTest Input: {json.dumps(input_data, indent=2)}\n", flush=True)
+    
+    asyncio.run(main(input_data))

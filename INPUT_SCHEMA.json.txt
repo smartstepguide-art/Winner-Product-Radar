@@ -1,0 +1,81 @@
+{
+  "title": "Winner Product Radar",
+  "description": "Discover winning products with the ultimate AliExpress/Alibaba research tool. Filter by trust score, verification, ratings, and order volume to find high-converting products.",
+  "schemaVersion": 1,
+  "inputSchema": {
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+      "searchTerms": {
+        "title": "Search Terms",
+        "description": "Keywords to search for (one per line or comma-separated)",
+        "type": "string",
+        "editor": "textfield"
+      },
+      "maxProductsPerTerm": {
+        "title": "Max Products Per Term",
+        "description": "Maximum number of products to fetch per search term",
+        "type": "integer",
+        "default": 50,
+        "minimum": 1,
+        "maximum": 200
+      },
+      "onlyVerified": {
+        "title": "Verified Suppliers Only",
+        "description": "Only include products from verified suppliers",
+        "type": "boolean",
+        "default": true
+      },
+      "onlyGoldSuppliers": {
+        "title": "Gold Suppliers Only",
+        "description": "Only include products from Gold Suppliers",
+        "type": "boolean",
+        "default": true
+      },
+      "minRating": {
+        "title": "Minimum Rating",
+        "description": "Minimum product rating (0-5)",
+        "type": "number",
+        "default": 4.5,
+        "minimum": 0,
+        "maximum": 5
+      },
+      "minOrders": {
+        "title": "Minimum Orders",
+        "description": "Minimum number of orders to include product",
+        "type": "integer",
+        "default": 100,
+        "minimum": 0
+      },
+      "minStoreYears": {
+        "title": "Minimum Store Years",
+        "description": "Minimum years supplier has been in business",
+        "type": "integer",
+        "default": 1,
+        "minimum": 0
+      },
+      "checkQualityKeywords": {
+        "title": "Check Quality Keywords",
+        "description": "Filter products with quality-related keywords (Original, Authentic, ISO, CE certified)",
+        "type": "boolean",
+        "default": false
+      },
+      "trustScoreThreshold": {
+        "title": "Trust Score Threshold",
+        "description": "Minimum trust score (0-100) to include product",
+        "type": "integer",
+        "default": 70,
+        "minimum": 0,
+        "maximum": 100
+      },
+      "outputFormat": {
+        "title": "Output Format",
+        "description": "Format for results",
+        "type": "string",
+        "default": "both",
+        "enum": ["json", "csv", "both"]
+      }
+    },
+    "required": ["searchTerms"]
+  }
+}
