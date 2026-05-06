@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+Winner Product Radar - SaaS Edition (Diagnostic Version)
+========================================================
+"""
+
+import asyncio
+import csv
+import json
+import math
+import re
+import sys
+import os
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+
+try:
+    from apify_client import ApifyClientAsync
+    from apify import Actor
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "apify", "apify-client"])
+    from apify_client import ApifyClientAsync
+    from apify import Actor
+
+@dataclass
+class Product:
+    name: str = ""
+    url: str = ""
+    price: str = ""
+    rating: float = 0.0
+    orders: int = 0
+    store_name: str = ""
+    store_years: int = 0
+    is_verified: bool = False
+    is_gold_supplier: bool = False
+    raw_data: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class ScoredProduct:
+    product: Product
+    trust_score: float = 0.0
+    is_winner: bool = False
+    matched_signals: List[str] = field(default_factory=list)
+
+class TrustAlgorithm:
+    def __init__(self, inp: Dict[str, Any]):
+        self.min_rating = float(inp.get("minRating", 4.5))
+        self.min_orders = int(inp.get("minOrders", 100))
+        self.min_store_years = int(inp.get("minStoreYears", 1))
+        self.only_verified = inp.get("onlyVerified", True)
+        self.only_gold = inp.get("onlyGoldSuppliers", True)
+        self.trust_threshold = int(inp.get("trustScoreThreshold", 70))
+
+    def score(self, p: Product) -> tuple[float, List[str]]:
+        sigs = []
+        r_score = min(100, (p.rating / 5.0) * 100) if p.rating > 0 else 0
+        o_score = (math.log(p.orders + 1) / math.log(10001)) * 100 if p.orders > 0 else 0
+        v_score = (50 if p.is_verified else 0) + (30 if p.is_gold_supplier else 0)
+        s_score = min(100, (p.store_years / (p.store_years + 2)) * 120) if p.store_years > 0 else 0
+        
+        final = (r_score * 0.3) + (o_score * 0.4) + (v_score * 0.2) + (s_score * 0.1)
+        return round(final, 1), sigs
+
+    def validate(self, sp: ScoredProduct) -> bool:
+        p = sp.product
+        if self.only_verified and not p.is_verified: return False
+        if self.only_gold and not p.is_gold_supplier: return False
+        if p.rating < self.min_rating: return False
+        if p.orders < self.min_orders: return False
+        if sp.trust_score < self.trust_threshold: return False
+        return True
+
+def parse_num(val: Any) -> int:
+    if not val: return 0
+    t = str(val).lower().replace(",", "")
+    if "k" in t:
+        try: return int(float(t.replace("k","").replace("+","")) * 1000)
+        except: pass
+    match = re.search(r"[\d]+", t)
+    return int(match.group()) if match else 0
+
+def extract_product_from_item(item: Dict[str, Any]) -> Optional[Product]:
+    try:
+        # البحث العميق عن البيانات بأي مسمى محتمل
+        str_item = str(item).lower()
+        json_item = json.dumps(item).lower()
+        
+        name = item.get("title") or item.get("subject") or item.get("productName") or "Unknown Product"
+        url = item.get("productUrl") or item.get("detailUrl") or item.get("url") or ""
+        price = item.get("price") or item.get("FOBPrice") or item.get("productPrice") or "N/A"
+        
+        rating = item.get("reviewScore") or item.get("rating") or item.get("score") or 0.0
+        try: rating = float(rating)
+        except: rating = 0.0
+        
+        orders = item.get("orders") or item.get("sales") or item.get("buyers") or item.get("transactions") or 0
+        orders = parse_num(orders)
+        
+        store = item.get("supplierName") or item.get("companyName") or item.get("storeName") or "Unknown Store"
+        
+        yrs_match = re.search(r"(\d+)\s*(?:yrs?|years?)", json_item)
+        store_years = int(yrs_match.group(1)) if yrs_match else 0
+        
+        is_verified = "verified" in json_item or "trade assurance" in json_item
+        is_gold = "gold" in json_item or store_years > 0
+        
+        return Product(name, url, str(price), rating, orders, str(store), store_years, is_verified, is_gold, item)
+    except Exception as e:
+        return None
+
+class ApifyScraper:
+    def __init__(self, token: str):
+        self.client = ApifyClientAsync(token)
+    
+    async def search(self, term: str, max_p: int) -> List[Product]:
+        run_input = {
+            "queries": [term], 
+            "maxItems": max_p,
+            "proxyConfiguration": {"useApifyProxy": True}
+        }
+        
+        Actor.log.info(f"Connecting to fatihtahta/alibaba-scraper for: '{term}'")
+        call = await self.client.actor("fatihtahta/alibaba-scraper").call(run_input=run_input)
+        
+        if call.get("status") != "SUCCEEDED": return []
+        
+        items_iter = self.client.dataset(call["defaultDatasetId"]).iterate_items()
+        items = [item async for item in items_iter]
+        
+        # == كود التجسس لمعرفة التركيبة السرية ==
+        if items:
+            Actor.log.info("🕵️‍♂️ DEBUG: Printing the secret structure of the FIRST product:")
+            Actor.log.info(json.dumps(items[0], indent=2)[:1500])
+        
+        return [p for item in items if (p := extract_product_from_item(item)) is not None]
+
+async def main():
+    async with Actor:
+        Actor.log.info("🚀 Winner Product Radar Starting...")
+        inp = await Actor.get_input() or {}
+        token = inp.get("apifyToken")
+        
+        if not token:
+            Actor.log.error("❌ No Apify Token provided!")
+            return
+
+        scraper = ApifyScraper(token)
+        algo = TrustAlgorithm(inp)
+        terms = [t.strip() for t in inp.get("searchTerms", "gaming mouse").split(",") if t.strip()]
+        
+        all_winners = []
+        all_parsed = []
+        
+        for term in terms:
+            products = await scraper.search(term, int(inp.get("maxProductsPerTerm", 50)))
+            for p in products:
+                score, sigs = algo.score(p)
+                sp = ScoredProduct(p, score, False, sigs)
+                all_parsed.append(sp)
+                if algo.validate(sp):
+                    sp.is_winner = True
+                    all_winners.append(sp)
+
+        all_winners.sort(key=lambda x: x.trust_score, reverse=True)
+        
+        # == وضع الطوارئ: عرض البيانات بالقوة إذا فشلت الخوارزمية ==
+        if not all_winners and all_parsed:
+            Actor.log.warning("⚠️ No winners found! Bypassing filters to show you the raw parsed data...")
+            all_winners = all_parsed[:50] # نعرض أول 50 منتج بالقوة
+        
+        dataset_records = []
+        for rank, s in enumerate(all_winners, 1):
+            dataset_records.append({
+                "Rank": rank,
+                "Name": s.product.name,
+                "Trust Score": f"{s.trust_score} / 100",
+                "Price": s.product.price,
+                "Rating": s.product.rating,
+                "Orders": s.product.orders,
+                "Store": s.product.store_name,
+                "URL": s.product.url
+            })
+            
+        if dataset_records:
+            await Actor.push_data(dataset_records)
+            Actor.log.info(f"🎉 Saved {len(dataset_records)} items to the Dataset.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
